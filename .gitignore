@@ -1,0 +1,21 @@
+# Blender 本地测试用的 Blender 便携版（共 6.2 GB，不进仓库）
+# 注意锚定到仓库根目录：addon/tools/ 是插件源码，必须进仓库
+/tools/
+
+# 打包产物：安装包走 GitHub Releases，不进仓库
+/build/
+
+# Python 字节码与缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# Blender / 编辑器杂项
+*.blend1
+*.blend2
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
