@@ -245,6 +245,13 @@ def extract_selection_to_object(bm, source_obj, name, kind):
 
     def get_edge(edge):
         verts = (vert_map[edge.verts[0].index], vert_map[edge.verts[1].index])
+        if verts[0] is verts[1]:
+            return None
+        if (verts[0].co - verts[1].co).length <= geometry_mod.MERGE_DISTANCE:
+            # Zero-length edge (coincident endpoints): copying it
+            # would crash set_edge_flags' coordinate re-fetch and
+            # adds nothing to the container.
+            return None
         existing = new_bm.edges.get(verts)
         if existing is not None:
             return existing

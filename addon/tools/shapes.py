@@ -142,6 +142,11 @@ class ShapeToolBase(SketchUpToolBase):
                 local_b = self.edit_context.to_local(b)
                 geometry_mod.apply_line(bm, local_a, local_b)
                 committed.append((local_a, local_b))
+            if closed:
+                # The generic healer caps cycle length, so a
+                # high-segment circle would stay open without this.
+                loop_coords = [local_a for local_a, _b in committed]
+                geometry_mod.ensure_loop_face(bm, loop_coords)
             # Tag the edges that make up the curve: re-find them by
             # endpoints (apply_line may have split existing edges).
             mesh = self.edit_context.mesh

@@ -334,7 +334,9 @@ def scenario_offset_preselected(module):
     driver = ToolDriver(module.tools.extrude.SKETCHUP_OT_tool_offset, make_context()).start()
     driver.move(120, 60)
     driver.click(120, 60)
-    check("offset preselected 8/8/2", mesh_stats() == (8, 8, 2), str(mesh_stats()))
+    # 1.0.1: the outer face ring-splits (8 triangles) + inner face,
+    # instead of two overlapping quads.
+    check("offset preselected 8/16/9", mesh_stats() == (8, 16, 9), str(mesh_stats()))
     driver.finish()
 
 
@@ -345,7 +347,8 @@ def scenario_offset_vcb(module):
     driver.click(100, 50)
     driver.type_text("100")
     driver.enter()
-    check("offset vcb 8/8/2", mesh_stats() == (8, 8, 2), str(mesh_stats()))
+    # 1.0.1: ring-split counts (see scenario_offset_preselected).
+    check("offset vcb 8/16/9", mesh_stats() == (8, 16, 9), str(mesh_stats()))
     coords = rounded_coords()
     check(
         "offset inner loop",

@@ -448,6 +448,151 @@ def suite_coverage(module):
     check("translation coverage", not missing, str(missing[:5]))
 
 
+def suite_extrude_101(module):
+    """1.0.1 regressions: Push/Pull must stretch adjacent faces
+    (no interior face / seam edges on solids), and grouping must
+    survive degenerate edges."""
+    geometry = module.core.geometry
+    extrude = module.tools.extrude
+    containers = module.core.containers
+
+    def apply_rect(bm, x0, y0, x1, y1):
+        pts = [Vector((x0, y0, 0)), Vector((x1, y0, 0)),
+               Vector((x1, y1, 0)), Vector((x0, y1, 0))]
+        for i in range(4):
+            geometry.apply_line(bm, pts[i], pts[(i + 1) % 4])
+
+    # Cube top pull -> clean taller box.
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=2.0)
+    geometry.refresh(bm)
+    top = max(bm.faces, key=lambda f: f.calc_center_median().z)
+    _created, stretched = extrude.extrude_face_prism(bm, top, 1.0, False)
+    geometry.refresh(bm)
+    check("extrude cube counts",
+          (len(bm.verts), len(bm.edges), len(bm.faces)) == (8, 12, 6),
+          str((len(bm.verts), len(bm.edges), len(bm.faces))))
+    check("extrude cube no seam edges",
+          all(len(e.link_faces) <= 2 for e in bm.edges))
+    check("extrude cube stretched 4", len(stretched) == 4, str(len(stretched)))
+    bm.free()
+
+    # Isolated face pull -> box with the bottom kept.
+    bm = bmesh.new()
+    apply_rect(bm, 0, 0, 1, 1)
+    geometry.refresh(bm)
+    _created, stretched = extrude.extrude_face_prism(bm, bm.faces[0], 1.0, False)
+    geometry.refresh(bm)
+    check("extrude isolated counts",
+          (len(bm.verts), len(bm.edges), len(bm.faces)) == (8, 12, 6),
+          str((len(bm.verts), len(bm.edges), len(bm.faces))))
+    check("extrude isolated bottom kept",
+          any(all(abs(v.co.z) < 1e-6 for v in f.verts) for f in bm.faces))
+    check("extrude isolated stretched none", len(stretched) == 0)
+    bm.free()
+
+    # Mixed pull: two coplanar quads, pull one.
+    bm = bmesh.new()
+    apply_rect(bm, 0, 0, 1, 1)
+    apply_rect(bm, 1, 0, 2, 1)
+    geometry.refresh(bm)
+    left = min(bm.faces, key=lambda f: f.calc_center_median().x)
+    _created, stretched = extrude.extrude_face_prism(bm, left, 1.0, False)
+    geometry.refresh(bm)
+    check("extrude mixed no >2-face edges",
+          all(len(e.link_faces) <= 2 for e in bm.edges))
+    check("extrude mixed stretched 1", len(stretched) == 1, str(len(stretched)))
+    check("extrude mixed 6 faces", len(bm.faces) == 6, "faces=%d" % len(bm.faces))
+    bm.free()
+
+    # Negative pull (recess) and zero-distance no-op.
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=2.0)
+    geometry.refresh(bm)
+    top = max(bm.faces, key=lambda f: f.calc_center_median().z)
+    extrude.extrude_face_prism(bm, top, -0.5, False)
+    geometry.refresh(bm)
+    check("extrude negative counts",
+          (len(bm.verts), len(bm.edges), len(bm.faces)) == (12, 20, 10),
+          str((len(bm.verts), len(bm.edges), len(bm.faces))))
+    bm.free()
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=2.0)
+    geometry.refresh(bm)
+    top = max(bm.faces, key=lambda f: f.calc_center_median().z)
+    created, _s = extrude.extrude_face_prism(bm, top, 0.0, False)
+    geometry.refresh(bm)
+    check("extrude zero no-op",
+          (len(bm.verts), len(bm.edges), len(bm.faces)) == (8, 12, 6)
+          and created == [])
+    bm.free()
+
+    # Retype simulation: pull, delete created, restore stretched,
+    # re-pull with a new distance.
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=2.0)
+    geometry.refresh(bm)
+    top = max(bm.faces, key=lambda f: f.calc_center_median().z)
+    loop = [v.co.copy() for v in top.verts]
+    created, stretched = extrude.extrude_face_prism(bm, top, 1.0, False)
+    geometry.refresh(bm)
+    extrude.delete_verts_at_coords(bm, created)
+    for snap_loop, mat, smooth in stretched:
+        verts = [geometry.get_or_create_vert(bm, co) for co in snap_loop]
+        geometry.refresh(bm)
+        restored = bm.faces.new(tuple(verts))
+        restored.material_index = mat
+        restored.smooth = smooth
+    geometry.refresh(bm)
+    face = None
+    wanted = sorted((round(c.x, 6), round(c.y, 6), round(c.z, 6)) for c in loop)
+    for candidate in bm.faces:
+        got = sorted((round(v.co.x, 6), round(v.co.y, 6), round(v.co.z, 6))
+                     for v in candidate.verts)
+        if got == wanted:
+            face = candidate
+            break
+    if face is None:
+        verts = [geometry.get_or_create_vert(bm, co) for co in loop]
+        geometry.refresh(bm)
+        face = bm.faces.new(tuple(verts))
+    extrude.extrude_face_prism(bm, face, 0.5, False)
+    geometry.refresh(bm)
+    check("extrude retype counts",
+          (len(bm.verts), len(bm.edges), len(bm.faces)) == (8, 12, 6),
+          str((len(bm.verts), len(bm.edges), len(bm.faces))))
+    check("extrude retype height", max(v.co.z for v in bm.verts) == 1.5)
+    bm.free()
+
+    # Grouping a selection containing a zero-length edge: no crash.
+    clear_scene()
+    mesh = bpy.data.meshes.new("M101")
+    obj = bpy.data.objects.new("Model101", mesh)
+    bpy.context.collection.objects.link(obj)
+    bm = bmesh.new()
+    quad = [bm.verts.new(Vector(c)) for c in
+            [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)]]
+    z0 = bm.verts.new(Vector((0.5, 0.5, 0)))
+    z1 = bm.verts.new(Vector((0.5, 0.5, 0)))
+    bm.verts.ensure_lookup_table()
+    bm.faces.new(tuple(quad))
+    bm.edges.new((z0, z1))
+    geometry.refresh(bm)
+    for element in list(bm.faces) + list(bm.edges) + list(bm.verts):
+        element.select = True
+    try:
+        result = containers.extract_selection_to_object(
+            bm, obj, "Group101", containers.KIND_GROUP
+        )
+        check("extract degenerate no crash", result is not None)
+        if result is not None:
+            bpy.data.objects.remove(result, do_unlink=True)
+    except ValueError as exc:
+        check("extract degenerate no crash", False, str(exc))
+    bm.free()
+    clear_scene()
+
+
 def run(module):
     """Run all P4-P6 suites; returns exit code."""
     FAILED.clear()
@@ -456,6 +601,7 @@ def run(module):
     suite_data(module)
     suite_containers(module)
     suite_edit_ops(module)
+    suite_extrude_101(module)
     suite_coverage(module)
     clear_scene()
     print("p4p6 suite: %s" % ("ALL PASS" if not FAILED else "%d FAILURES: %s" % (len(FAILED), FAILED)))

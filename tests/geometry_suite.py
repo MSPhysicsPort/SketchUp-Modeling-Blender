@@ -172,6 +172,100 @@ def run(geometry_module=None):
     check("pyramid 4 faces", len(bm.faces) == 4, "faces=%d" % len(bm.faces))
     bm.free()
 
+    # 12. Default 24-segment circle heals (1.0.1: the old 16-cycle
+    # cap left it open on real machines).
+    import math
+
+    bm = bmesh.new()
+    pts = [
+        (math.cos(2.0 * math.pi * i / 24.0), math.sin(2.0 * math.pi * i / 24.0), 0.0)
+        for i in range(24)
+    ]
+    for i in range(24):
+        geometry.apply_line(bm, pts[i], pts[(i + 1) % 24])
+    check("24-gon 1 face", len(bm.faces) == 1, "faces=%d" % len(bm.faces))
+    check("24-gon 24 edges", len(bm.edges) == 24, "edges=%d" % len(bm.edges))
+    bm.free()
+
+    # 13. 48-segment loop via ensure_loop_face (beyond the cap).
+    bm = bmesh.new()
+    pts = [
+        (math.cos(2.0 * math.pi * i / 48.0), math.sin(2.0 * math.pi * i / 48.0), 0.0)
+        for i in range(48)
+    ]
+    for i in range(48):
+        geometry.apply_line(bm, pts[i], pts[(i + 1) % 48])
+    face = geometry.ensure_loop_face(bm, [Vector(p) for p in pts])
+    check("48-gon ensure_loop_face", face is not None and len(bm.faces) == 1,
+          "faces=%d" % len(bm.faces))
+    bm.free()
+
+    # 14. Loop inside a face splits it into a ring + inner face;
+    # deleting the inner face leaves a real hole (1.0.1).
+    from mathutils.bvhtree import BVHTree
+
+    bm = bmesh.new()
+    rect(bm)
+    inner = [(0.5, 0.5, 0), (1.5, 0.5, 0), (1.5, 1.5, 0), (0.5, 1.5, 0)]
+    for i in range(4):
+        geometry.apply_line(bm, inner[i], inner[(i + 1) % 4])
+    geometry.refresh(bm)
+    check("ring split 9 faces", len(bm.faces) == 9, "faces=%d" % len(bm.faces))
+    target = None
+    for candidate in bm.faces:
+        if len(candidate.verts) == 4 and abs(candidate.calc_center_median().x - 1.0) < 1e-6:
+            target = candidate
+    check("ring inner face found", target is not None)
+    if target is not None:
+        bm.faces.remove(target)
+        geometry.refresh(bm)
+        bvh = BVHTree.FromBMesh(bm)
+        hit = bvh.ray_cast(Vector((1.0, 1.0, 1.0)), Vector((0, 0, -1)))[0]
+        check("ring hole after delete", hit is None, "hit=%s" % (hit,))
+    bm.free()
+
+    # 15. Nested loops: each level ring-splits (8 + 8 + 1 faces).
+    bm = bmesh.new()
+    for x0, y0, x1, y1 in ((0, 0, 4, 4), (1, 1, 3, 3), (1.5, 1.5, 2.5, 2.5)):
+        loop = [(x0, y0, 0), (x1, y0, 0), (x1, y1, 0), (x0, y1, 0)]
+        for i in range(4):
+            geometry.apply_line(bm, loop[i], loop[(i + 1) % 4])
+    check("nested loops 17 faces", len(bm.faces) == 17, "faces=%d" % len(bm.faces))
+    bm.free()
+
+    # 16. set_edge_flags survives degenerate edges and flags the
+    # right edge when distinct vertices share coordinates (1.0.1
+    # real-machine G crash).
+    bm = bmesh.new()
+    v0 = bm.verts.new(Vector((0, 0, 0)))
+    v1 = bm.verts.new(Vector((0, 0, 0)))
+    bm.verts.ensure_lookup_table()
+    edge = bm.edges.new((v0, v1))
+    geometry.refresh(bm)
+    try:
+        geometry.set_edge_flags(bm, edge, soft=True)
+        check("degenerate edge flags no crash", True)
+    except ValueError as exc:
+        check("degenerate edge flags no crash", False, str(exc))
+    bm.free()
+    bm = bmesh.new()
+    a0 = bm.verts.new(Vector((0, 0, 0)))
+    a1 = bm.verts.new(Vector((1, 0, 0)))
+    b0 = bm.verts.new(Vector((0, 0, 0)))
+    b1 = bm.verts.new(Vector((1, 0, 0)))
+    bm.verts.ensure_lookup_table()
+    e1 = bm.edges.new((a0, a1))
+    e2 = bm.edges.new((b0, b1))
+    geometry.refresh(bm)
+    idx1, idx2 = e1.index, e2.index
+    geometry.set_edge_flags(bm, e2, soft=True)
+    geometry.refresh(bm)
+    f1 = geometry.edge_flags(bm, bm.edges[idx1])
+    f2 = geometry.edge_flags(bm, bm.edges[idx2])
+    check("duplicate-coord edge targeted", f1 == 0 and f2 == geometry.FLAG_SOFT,
+          "f1=%d f2=%d" % (f1, f2))
+    bm.free()
+
     print("geometry: %s" % ("ALL PASS" if check.failed == 0 else "%d FAILURES" % check.failed))
     return 0 if check.failed == 0 else 1
 

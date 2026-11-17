@@ -3,7 +3,7 @@
 GitHub：https://github.com/MSPhysicsPort/SketchUp-Modeling-Blender（公开独立仓库，与 MSPhysics 仓库分开）
 
 更新：2026-11-17 11:20 UTC
-阶段：1.0.0 全量版已交付 Sen（P4+P5+P6，沙盒除外）；Sen 不再逐版验收，只交付可用版本
+阶段：1.0.1 已交付 Sen（真机反馈四项修复：推拉拉伸、面内扣洞、圆封面、G 报错）；Sen 不再逐版验收，只交付可用版本
 
 ## 目标
 在 Blender 里用 SketchUp 的建模逻辑完成建模；完整复刻 SketchUp 建模工具+逻辑+工具菜单；最终能在 Blender 里实际安装使用。参照 SketchUp 2026（classic 基线，2027 Procedural 功能不在基线内）。

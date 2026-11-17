@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "sketchup_modeling"
-version = "1.0.0"
+version = "1.0.1"
 name = "SketchUp Modeling"
 tagline = "Model in Blender with SketchUp tools and logic"
 maintainer = "Ember"

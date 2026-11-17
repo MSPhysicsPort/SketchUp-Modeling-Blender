@@ -12,15 +12,17 @@ edit runs through this module. Functions take a BMesh and mutate it
 in place; callers own the edit-mesh / object-mesh sync.
 
 Known P1 limitations (honest, see proposal §3.2):
-- A closed loop drawn fully INSIDE an existing face creates an
-  overlapping inner face; the ring/disk split needs the logical-face
-  model of P4 (Blender faces cannot have holes).
+- A closed loop drawn fully INSIDE an existing face is split into a
+  ring triangulation plus the inner face (1.0.1), so deleting the
+  inner face leaves a real hole. Loops that touch or cross the face
+  boundary keep the older overlapping behavior.
 - Plane fitting for cycle detection tries a few vertex triples; a
   component whose loops lie on several different planes is only
   healed on the first fitting plane per seed component.
 """
 
 import bmesh
+import math
 from mathutils import Vector
 
 try:
@@ -291,7 +293,7 @@ def split_edges_at_crossings(bm, edge, tol=MERGE_DISTANCE):
 # heal correctly — a single component-level plane fit cannot do that.
 # ---------------------------------------------------------------------------
 
-MAX_CYCLE_LENGTH = 16
+MAX_CYCLE_LENGTH = 32
 MAX_CYCLES_PER_COMPONENT = 1000
 MAX_DFS_STEPS_PER_COMPONENT = 20000
 
@@ -384,6 +386,225 @@ def _newell_normal(points):
     return normal
 
 
+def _plane_basis(normal):
+    """Orthonormal (u, v) basis for a plane with the given normal."""
+    n = Vector(normal).normalized()
+    helper = Vector((0.0, 0.0, 1.0)) if abs(n.z) < 0.9 else Vector((0.0, 1.0, 0.0))
+    u = n.cross(helper).normalized()
+    v = n.cross(u).normalized()
+    return u, v
+
+
+def _point_in_polygon_2d(point, polygon):
+    """Ray-casting point-in-polygon test (boundary counts as
+    outside; callers check boundary distance separately)."""
+    x, y = point
+    inside = False
+    j = len(polygon) - 1
+    for i in range(len(polygon)):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        if (yi > y) != (yj > y):
+            x_int = xi + (y - yi) * (xj - xi) / (yj - yi)
+            if x < x_int:
+                inside = not inside
+        j = i
+    return inside
+
+
+def _point_segment_distance_2d(point, a, b):
+    px, py = point
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    denom = dx * dx + dy * dy
+    if denom == 0.0:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / denom))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def _loop_strictly_inside_2d(outer_2d, inner_2d, tol):
+    """True when the inner loop lies strictly inside the outer
+    polygon: every inner vertex strictly inside, and no inner edge
+    crosses the outer boundary."""
+    for point in inner_2d:
+        for i in range(len(outer_2d)):
+            dist = _point_segment_distance_2d(
+                point, outer_2d[i], outer_2d[(i + 1) % len(outer_2d)]
+            )
+            if dist <= tol:
+                return False
+        if not _point_in_polygon_2d(point, outer_2d):
+            return False
+    for i in range(len(inner_2d)):
+        a1, a2 = inner_2d[i], inner_2d[(i + 1) % len(inner_2d)]
+        for j in range(len(outer_2d)):
+            b1, b2 = outer_2d[j], outer_2d[(j + 1) % len(outer_2d)]
+            if segments_intersect_2d(a1, a2, b1, b2) is not None:
+                return False
+    return True
+
+
+def _split_faces_with_inner_loops(bm, inner_faces, outer_snapshots, tol=MERGE_DISTANCE):
+    """Replace outer faces that strictly contain new inner faces
+    with ring triangulations (SketchUp face-with-hole emulation:
+    bmesh faces cannot have holes, so the ring becomes triangles
+    and the inner loop stays its own face; deleting the inner face
+    then leaves a real hole).
+
+    ``outer_snapshots`` maps face index -> (material_index, smooth)
+    for faces that existed before the inner faces were created.
+    Returns the ring faces created. Nested inner loops closed in
+    a single call are split against the outer face only; nesting
+    across separate edits resolves naturally because each edit
+    heals against the faces that already exist.
+    """
+    if not inner_faces or not outer_snapshots:
+        return []
+    try:
+        from mathutils.geometry import tessellate_polygon
+    except ImportError:
+        return []
+    refresh(bm)
+    # Fresh faces have a zero normal until recalculated; the
+    # coplanarity check below reads face normals, so update them
+    # first (without this, a split requested from inside
+    # heal_faces silently finds nothing).
+    bm.normal_update()
+    inners = []
+    for face in inner_faces:
+        if not face.is_valid:
+            continue
+        inners.append(
+            ([v.index for v in face.verts],
+             [v.co.copy() for v in face.verts],
+             Vector(face.normal))
+        )
+    if not inners:
+        return []
+    groups = {}
+    for outer_index in outer_snapshots:
+        if outer_index < 0 or outer_index >= len(bm.faces):
+            continue
+        outer = bm.faces[outer_index]
+        if not outer.is_valid:
+            continue
+        origin = outer.verts[0].co
+        normal = Vector(outer.normal).normalized()
+        outer_coords = [v.co.copy() for v in outer.verts]
+        outer_min = [min(c[k] for c in outer_coords) for k in range(3)]
+        outer_max = [max(c[k] for c in outer_coords) for k in range(3)]
+        u, v = _plane_basis(normal)
+        outer_2d = [((co - origin).dot(u), (co - origin).dot(v))
+                    for co in outer_coords]
+        for entry in inners:
+            _indices, coords, face_normal = entry
+            if abs(face_normal.normalized().dot(normal)) < 1.0 - 1e-6:
+                continue
+            if any(abs((co - origin).dot(normal)) > PLANAR_TOLERANCE
+                   for co in coords):
+                continue
+            inside_bbox = True
+            for k in range(3):
+                inner_min = min(c[k] for c in coords)
+                inner_max = max(c[k] for c in coords)
+                if inner_min < outer_min[k] - tol or inner_max > outer_max[k] + tol:
+                    inside_bbox = False
+                    break
+            if not inside_bbox:
+                continue
+            inner_2d = [((co - origin).dot(u), (co - origin).dot(v))
+                        for co in coords]
+            if _loop_strictly_inside_2d(outer_2d, inner_2d, tol):
+                groups.setdefault(outer_index, []).append(entry)
+    created = []
+    for outer_index, entries in groups.items():
+        outer = bm.faces[outer_index]
+        if not outer.is_valid:
+            continue
+        material_index, smooth = outer_snapshots[outer_index]
+        outer_indices = [v.index for v in outer.verts]
+        outer_coords = [v.co.copy() for v in outer.verts]
+        outer_normal = Vector(outer.normal)
+        hole_indices = []
+        hole_coords = []
+        for indices, coords, _normal in entries:
+            hole_indices.append(indices)
+            hole_coords.append(coords)
+        try:
+            triangles = tessellate_polygon([outer_coords] + hole_coords)
+        except Exception:
+            continue
+        all_indices = outer_indices + [i for loop in hole_indices for i in loop]
+        bm.faces.remove(outer)
+        refresh(bm)
+        for tri in triangles:
+            if len(set(tri)) != 3:
+                continue
+            verts = [bm.verts[all_indices[i]] for i in tri]
+            tri_normal = (verts[1].co - verts[0].co).cross(
+                verts[2].co - verts[0].co
+            )
+            if tri_normal.length <= 1e-12:
+                continue
+            if tri_normal.dot(outer_normal) < 0:
+                verts = [verts[0], verts[2], verts[1]]
+            try:
+                new_face = bm.faces.new(tuple(verts))
+            except ValueError:
+                continue
+            new_face.material_index = material_index
+            new_face.smooth = smooth
+            created.append(new_face)
+    if created:
+        bm.normal_update()
+    return created
+
+
+def ensure_loop_face(bm, coords, tol=MERGE_DISTANCE):
+    """Create a face for a known closed loop (shape tools), when the
+    generic healer did not: cycle enumeration is capped
+    (MAX_CYCLE_LENGTH), so high-segment circles would otherwise
+    stay open. Returns the face (existing or new), or None when
+    the loop is not committable. A face created strictly inside
+    an existing coplanar face splits that face into a ring.
+    """
+    ensure_layers(bm)
+    refresh(bm)
+    if len(coords) < 3:
+        return None
+    pre_existing = {f.index: (f.material_index, f.smooth) for f in bm.faces}
+    verts = []
+    for co in coords:
+        vert = find_vert_near(bm, co, tol)
+        if vert is None:
+            return None
+        verts.append(vert)
+    if len({v.index for v in verts}) != len(verts):
+        return None
+    for i in range(len(verts)):
+        a, b = verts[i], verts[(i + 1) % len(verts)]
+        if bm.edges.get((a, b)) is None:
+            return None
+    key = frozenset(v.index for v in verts)
+    for face in bm.faces:
+        if frozenset(v.index for v in face.verts) == key:
+            return face
+    points = [v.co for v in verts]
+    if _cycle_plane(points) is None:
+        return None
+    if _newell_normal(points).length <= 2.0 * MIN_FACE_AREA:
+        return None
+    try:
+        face = bm.faces.new(tuple(verts))
+    except ValueError:
+        return None
+    _split_faces_with_inner_loops(bm, [face], pre_existing, tol)
+    bm.normal_update()
+    return face
+
+
 def heal_faces(bm, seed_edges=None, tol=MERGE_DISTANCE):
     """Create faces for closed coplanar loops; returns new faces.
 
@@ -394,6 +615,7 @@ def heal_faces(bm, seed_edges=None, tol=MERGE_DISTANCE):
     """
     ensure_layers(bm)
     refresh(bm)
+    pre_existing = {f.index: (f.material_index, f.smooth) for f in bm.faces}
     if seed_edges is None:
         seed_edges = list(bm.edges)
     else:
@@ -485,6 +707,8 @@ def heal_faces(bm, seed_edges=None, tol=MERGE_DISTANCE):
             existing.add(key)
             created.append(face)
     if created:
+        ring = _split_faces_with_inner_loops(bm, created, pre_existing, tol)
+        created.extend(ring)
         bm.normal_update()
     return created
 
@@ -575,27 +799,52 @@ def edge_flags(bm, edge):
     return edge[layer]
 
 
+def _coords_match(got, wanted, tol=MERGE_DISTANCE):
+    """True when two endpoint pairs match in either order."""
+    (g1, g2), (w1, w2) = got, wanted
+    straight = (g1 - w1).length <= tol and (g2 - w2).length <= tol
+    swapped = (g1 - w2).length <= tol and (g2 - w1).length <= tol
+    return straight or swapped
+
+
 def set_edge_flags(bm, edge, soft=None, hidden=None):
     """Set Soft / Hidden flags; Soft also smooths the edge and its
     adjacent faces (Eraser+Ctrl = Soft+Smooth).
 
-    The edge is re-fetched by vertex coordinates: ensure_layers()
-    may create the flag layer, which invalidates element wrappers
-    fetched before the call (including ``edge`` itself).
+    The edge is re-fetched after ensure_layers() (creating the flag
+    layer invalidates element wrappers fetched before the call,
+    including ``edge`` itself). Re-fetch prefers the edge index,
+    verified against the captured endpoint coordinates: a pure
+    coordinate lookup collapses when two distinct vertices share
+    coordinates, and ``edges.get`` with the same vertex twice
+    raises ValueError (real-machine G crash, 1.0.1). Degenerate
+    edges (coincident endpoints) are skipped: there is no edge
+    to flag.
     """
     try:
         coords = (edge.verts[0].co.copy(), edge.verts[1].co.copy())
+        index = edge.index
     except ReferenceError:
         return None
     ensure_layers(bm)
     refresh(bm)
-    v1 = find_vert_near(bm, coords[0])
-    v2 = find_vert_near(bm, coords[1])
-    if v1 is None or v2 is None:
-        return None
-    live = bm.edges.get((v1, v2))
+    live = None
+    if 0 <= index < len(bm.edges):
+        candidate = bm.edges[index]
+        got = (candidate.verts[0].co, candidate.verts[1].co)
+        if _coords_match(got, coords):
+            live = candidate
     if live is None:
-        return None
+        v1 = find_vert_near(bm, coords[0])
+        v2 = find_vert_near(bm, coords[1])
+        if v1 is None or v2 is None or v1 is v2:
+            return None
+        try:
+            live = bm.edges.get((v1, v2))
+        except ValueError:
+            return None
+        if live is None:
+            return None
     layer = bm.edges.layers.int.get(EDGE_FLAGS_LAYER)
     flags = live[layer]
     if soft is not None:

@@ -133,6 +133,19 @@ def scenario_circle(module):
     driver.finish()
 
 
+def scenario_circle_default24(module):
+    # 1.0.1 regression: the default 24-segment circle must cap.
+    # (The 12-segment test passed even with the old 16-cycle cap.)
+    clear_scene()
+    context = make_context()
+    driver = ToolDriver(module.tools.shapes.SKETCHUP_OT_tool_circle, context).start()
+    check("circle default 24 segments", driver.op.segments == 24, str(driver.op.segments))
+    driver.click(100, 100)
+    driver.click(200, 100)
+    check("circle default 24/24/1", mesh_stats() == (24, 24, 1), str(mesh_stats()))
+    driver.finish()
+
+
 def scenario_center_inference(module):
     clear_scene()
     context = make_context()
@@ -407,6 +420,7 @@ def run(module):
     scenario_rectangle_square_golden(module)
     scenario_rectangle_plane_lock(module)
     scenario_circle(module)
+    scenario_circle_default24(module)
     scenario_center_inference(module)
     scenario_polygon(module)
     scenario_arc(module)

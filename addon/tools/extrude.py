@@ -26,18 +26,33 @@ DOUBLE_CLICK_SECONDS = 0.4
 def extrude_face_prism(bm, face, distance, keep_start):
     """Extrude a face along its normal by `distance`.
 
-    Positive distance: the original face stays as the bottom,
-    sides + top face are added (keep_start=True builds a separate
-    prism with its own bottom face, leaving the original face
-    untouched). Negative distance: the original face is removed
-    (opening) and sides + cap are added. Returns the list of newly
-    created vertex coordinates (for VCB retype undo).
+    Positive distance: faces adjacent to the pulled face are
+    stretched (their shared edge moves up with the face), side
+    faces are added only for free edges, and the original face is
+    removed when every loop edge is shared -- otherwise it would
+    stay behind as an interior face with seam edges (1.0.1: the
+    old prism-always version left exactly that extra line/face on
+    solids). keep_start=True builds a separate prism with its own
+    bottom face, leaving the original face untouched. Negative
+    distance: the original face is removed (opening) and sides +
+    cap are added. Near-zero distance is a no-op (it would create
+    degenerate zero-height geometry).
+
+    Returns (created_coords, stretched): the new vertex
+    coordinates (for VCB retype undo) and snapshots of the
+    stretched neighbor faces before stretching
+    (loop coords, material index, smooth), so a retype can
+    restore them before re-extruding.
     """
     refresh(bm)
+    if abs(distance) < 1e-6:
+        return [], []
+    # Fresh faces (e.g. rebuilt by a VCB retype) have a zero normal
+    # until recalculated; the extrude direction reads face.normal.
+    bm.normal_update()
     normal = Vector(face.normal)
     loop = [v.co.copy() for v in face.verts]
     loop_verts = list(face.verts)
-    created_coords = []
     if keep_start:
         bottom = [bm.verts.new(co) for co in loop]
         top = [bm.verts.new(co + normal * distance) for co in loop]
@@ -48,18 +63,88 @@ def extrude_face_prism(bm, face, distance, keep_start):
             j = (i + 1) % len(loop)
             bm.faces.new((bottom[i], bottom[j], top[j], top[i]))
         created_coords = [v.co.copy() for v in bottom + top]
-    else:
+        return created_coords, []
+    if distance < 0:
         top = [bm.verts.new(co + normal * distance) for co in loop]
         refresh(bm)
-        if distance < 0:
-            bm.faces.remove(face)
+        bm.faces.remove(face)
         bm.faces.new(tuple(top))
         for i in range(len(loop)):
             j = (i + 1) % len(loop)
             bm.faces.new((loop_verts[i], loop_verts[j], top[j], top[i]))
         created_coords = [v.co.copy() for v in top]
+        return created_coords, []
+    # Positive pull: stretch singly-shared neighbors, add side
+    # faces only for free (or non-manifold) loop edges.
+    top = [bm.verts.new(co + normal * distance) for co in loop]
     refresh(bm)
-    return created_coords
+    neighbor_subs = {}
+    side_edges = []
+    for i in range(len(loop)):
+        j = (i + 1) % len(loop)
+        edge = bm.edges.get((loop_verts[i], loop_verts[j]))
+        others = []
+        if edge is not None:
+            others = [f for f in edge.link_faces if f is not face and f.is_valid]
+        if len(others) == 1:
+            neighbor = others[0]
+            entry = neighbor_subs.get(neighbor.index)
+            if entry is None:
+                entry = (
+                    neighbor,
+                    {},
+                    ([v.co.copy() for v in neighbor.verts],
+                     neighbor.material_index, neighbor.smooth),
+                )
+                neighbor_subs[neighbor.index] = entry
+            entry[1][loop_verts[i].index] = top[i]
+            entry[1][loop_verts[j].index] = top[j]
+        else:
+            side_edges.append((i, j))
+    stretched = []
+    # Edges of faces about to be rebuilt/removed: removing a face
+    # leaves its edges behind as wires, so record them now and
+    # delete the ones left faceless afterwards (loop edges and the
+    # old vertical edges of stretched neighbors). Edges that keep
+    # a face -- reused by rebuilt faces, the cap, or side quads --
+    # are untouched, as are unrelated wire edges.
+    doomed = set()
+    for _index, (neighbor, _subs, _snap) in neighbor_subs.items():
+        for edge in neighbor.edges:
+            doomed.add((edge.verts[0].index, edge.verts[1].index))
+    if not side_edges:
+        for edge in face.edges:
+            doomed.add((edge.verts[0].index, edge.verts[1].index))
+    for _index, (neighbor, subs, snapshot) in neighbor_subs.items():
+        if not neighbor.is_valid:
+            continue
+        new_verts = [subs.get(v.index, v) for v in neighbor.verts]
+        material_index = neighbor.material_index
+        smooth = neighbor.smooth
+        bm.faces.remove(neighbor)
+        new_face = bm.faces.new(tuple(new_verts))
+        new_face.material_index = material_index
+        new_face.smooth = smooth
+        stretched.append(snapshot)
+    if not side_edges:
+        # Fully embedded in a solid: keeping the original face
+        # would leave an interior face behind.
+        bm.faces.remove(face)
+    bm.faces.new(tuple(top))
+    for i, j in side_edges:
+        bm.faces.new((loop_verts[i], loop_verts[j], top[j], top[i]))
+    refresh(bm)
+    for a, b in doomed:
+        va, vb = bm.verts[a], bm.verts[b]
+        edge = bm.edges.get((va, vb))
+        if edge is not None and not edge.link_faces:
+            bm.edges.remove(edge)
+    refresh(bm)
+    for vert in loop_verts:
+        if vert.is_valid and not vert.link_edges and not vert.link_faces:
+            bm.verts.remove(vert)
+    refresh(bm)
+    return [v.co.copy() for v in top], stretched
 
 
 def delete_verts_at_coords(bm, coords, tolerance=1e-6):
@@ -101,7 +186,7 @@ class SKETCHUP_OT_tool_push_pull(SketchUpToolBase):
         self._distance = 0.0
         self._last_click_time = 0.0
         self._last_click_face = None
-        self._last_op = None  # (loop, normal, distance, keep_start, created_coords)
+        self._last_op = None  # (loop, normal, distance, keep_start, created, stretched)
         self._keep_start = False
         self._limit_cache = None  # (face_index, mesh version, limit or None)
 
@@ -191,7 +276,7 @@ class SKETCHUP_OT_tool_push_pull(SketchUpToolBase):
             and now - self._last_click_time < DOUBLE_CLICK_SECONDS
         ):
             self._last_click_time = 0.0
-            _loop, _normal, distance, keep_start, _c = self._last_op
+            _loop, _normal, distance, keep_start, _c, _s = self._last_op
             self._apply_extrude(picked[1], distance, event.ctrl or keep_start)
             self._state = "WAIT_FACE"
             self.overlay.set_lines([])
@@ -215,10 +300,25 @@ class SKETCHUP_OT_tool_push_pull(SketchUpToolBase):
             self.overlay.set_lines([])
             return None
         if self._last_op is not None:
-            loop, normal, _d, keep_start, created = self._last_op
+            loop, normal, _d, keep_start, created, stretched = self._last_op
             bm = self.edit_context.begin()
             try:
                 delete_verts_at_coords(bm, created)
+                # Restore stretched neighbors before re-extruding:
+                # deleting the top verts removed them, and the
+                # re-extrude must see them to stretch again.
+                for snap_loop, material_index, smooth in stretched:
+                    verts = [
+                        geometry_mod.get_or_create_vert(bm, co)
+                        for co in snap_loop
+                    ]
+                    refresh(bm)
+                    try:
+                        restored = bm.faces.new(tuple(verts))
+                    except ValueError:
+                        continue
+                    restored.material_index = material_index
+                    restored.smooth = smooth
                 # Re-find the original face by its loop coords.
                 face = self._find_face_by_loop(bm, loop)
                 if face is None and not keep_start:
@@ -229,13 +329,15 @@ class SKETCHUP_OT_tool_push_pull(SketchUpToolBase):
                     refresh(bm)
                     face = bm.faces.new(tuple(verts))
                 if face is not None:
-                    created = extrude_face_prism(bm, face, value, keep_start)
+                    created, stretched = extrude_face_prism(
+                        bm, face, value, keep_start
+                    )
                 self.edit_context.commit(bm)
             except Exception:
                 self.edit_context.abort(bm)
                 raise
             undo_push("SketchUp Push/Pull")
-            self._last_op = (loop, normal, value, keep_start, created)
+            self._last_op = (loop, normal, value, keep_start, created, stretched)
             return None
         self.report({"WARNING"}, _T("Pick a face first"))
         return None
@@ -262,6 +364,8 @@ class SKETCHUP_OT_tool_push_pull(SketchUpToolBase):
         self.overlay.set_lines(lines)
 
     def _apply_extrude(self, face_index, distance, keep_start):
+        if abs(distance) < 1e-6:
+            return
         bm = self.edit_context.begin()
         try:
             refresh(bm)
@@ -282,13 +386,13 @@ class SKETCHUP_OT_tool_push_pull(SketchUpToolBase):
                     )
                     self._last_op = None
                     return
-            created = extrude_face_prism(bm, face, distance, keep_start)
+            created, stretched = extrude_face_prism(bm, face, distance, keep_start)
             self.edit_context.commit(bm)
         except Exception:
             self.edit_context.abort(bm)
             raise
         undo_push("SketchUp Push/Pull")
-        self._last_op = (loop, normal, distance, keep_start, created)
+        self._last_op = (loop, normal, distance, keep_start, created, stretched)
 
     @staticmethod
     def _find_face_by_loop(bm, loop):
